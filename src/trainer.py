@@ -1,19 +1,21 @@
+import logging
+import os
+
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader
-from .models.smec_wrapper import SMECModel
-from .models.memory import SelectiveCrossBatchMemory
-from .loss import SMECContrastiveLoss
-import logging
 from tqdm import tqdm
-import os
+
+from .loss import SMECLoss
+from .models.memory import SelectiveCrossBatchMemory
+from .models.smec_wrapper import SMECModel
 
 logger = logging.getLogger(__name__)
 
+
 class SMECTrainer:
-    """
-    Trainer for Sequential Matryoshka Embedding Compression.
-    """
+    """Trainer for Sequential Matryoshka Embedding Compression."""
+
     def __init__(
         self,
         model: SMECModel,
@@ -22,144 +24,142 @@ class SMECTrainer:
         learning_rate: float = 2e-5,
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
         output_dir: str = "./checkpoints",
-        max_length: int = 128
+        max_length: int = 128,
+        alpha: float = 0.2,
+        memory_size: int = 4096,
+        top_k: int = 10,
     ):
+        self.device = device
         self.model = model.to(device)
+        self.model.freeze_backbone()
         self.train_loader = train_loader
         self.val_loader = val_loader
-        self.device = device
         self.output_dir = output_dir
         self.max_length = max_length
         self.learning_rate = learning_rate
-        self.optimizer = optim.AdamW(model.parameters(), lr=learning_rate)
-        self.criterion = SMECContrastiveLoss()
-        
-        # Mixed Precision support
+        self.memory_size = memory_size
+        self.top_k = top_k
+        self.criterion = SMECLoss(alpha=alpha, top_k=top_k)
+        self.optimizer = None
         self.scaler = torch.cuda.amp.GradScaler(enabled=(device == "cuda"))
-        
-        # Memory Queue (S-XBM)
-        # Initialize with the model's currently active dimension.
-        # This queue is reset whenever target dimension changes during sequential training.
-        self.memory = SelectiveCrossBatchMemory(
-            memory_size=1024,  # Small for demo/testing
-            embedding_dim=getattr(self.model, "current_dim", self.model.embedding_dim),
-            device=device
-        )
-        
+        self.memory = self._new_memory()
+
         os.makedirs(output_dir, exist_ok=True)
 
+    def _new_memory(self):
+        return SelectiveCrossBatchMemory(
+            memory_size=self.memory_size,
+            embedding_dim=self.model.embedding_dim,
+            device=self.device,
+        )
+
     def train_one_epoch(self, epoch_idx: int, target_dim: int):
-        self.model.train()
-        total_loss = 0
-        
-        # Determine if we use memory
-        # S-XBM usually used when reducing dimension to maintain contrast with high-dim features?
-        # Or just standard hard negatives.
-        
+        self.model.freeze_backbone()
+        self.model.freeze_completed_stages()
+        total_loss = 0.0
+        total_rank = 0.0
+        total_preserve = 0.0
+
         pbar = tqdm(self.train_loader, desc=f"Epoch {epoch_idx} [Dim {target_dim}]")
         for batch in pbar:
-            # Batch: {'queries': [...], 'positives': [...], 'negatives': [...]}
-            # Tokenize
-            queries = self._tokenize(batch['queries'])
-            positives = self._tokenize(batch['positives'])
-            
-            # Forward with Mixed Precision
+            queries = self._tokenize(batch["queries"])
+            positives = self._tokenize(batch["positives"])
+
+            query_input_ids = queries["input_ids"].to(self.device)
+            query_attention = queries["attention_mask"].to(self.device)
+            positive_input_ids = positives["input_ids"].to(self.device)
+            positive_attention = positives["attention_mask"].to(self.device)
+
             with torch.cuda.amp.autocast(enabled=(self.device == "cuda")):
-                # Forward
-                q_emb = self.model(queries['input_ids'].to(self.device), queries['attention_mask'].to(self.device))
-                p_emb = self.model(positives['input_ids'].to(self.device), positives['attention_mask'].to(self.device))
-                
-                # Loss
-                loss = self.criterion(q_emb, p_emb, memory_queue=self.memory)
-            
-            # Backward with Scaler
-            self.optimizer.zero_grad()
+                query_original = self.model.encode_original(query_input_ids, query_attention)
+                positive_original = self.model.encode_original(positive_input_ids, positive_attention)
+                query_compressed = self.model.compress_embeddings(query_original, target_dim=target_dim)
+                positive_compressed = self.model.compress_embeddings(positive_original, target_dim=target_dim)
+
+                loss, parts = self.criterion(
+                    query_original=query_original,
+                    positive_original=positive_original,
+                    query_compressed=query_compressed,
+                    positive_compressed=positive_compressed,
+                    memory_queue=self.memory,
+                    compress_fn=lambda x: self.model.compress_embeddings(x, target_dim=target_dim),
+                )
+
+            self.optimizer.zero_grad(set_to_none=True)
             self.scaler.scale(loss).backward()
             self.scaler.step(self.optimizer)
             self.scaler.update()
-            
-            total_loss += loss.item()
-            pbar.set_postfix({'loss': loss.item()})
-            
-        avg_loss = total_loss / len(self.train_loader)
-        logger.info(f"End Epoch {epoch_idx} [Dim {target_dim}] - Avg Loss: {avg_loss:.4f}")
-        return avg_loss
+            self.memory.enqueue(positive_original)
+
+            loss_value = float(loss.detach().cpu())
+            rank_value = float(parts["rank_loss"].cpu())
+            preserve_value = float(parts["preserve_loss"].cpu())
+            total_loss += loss_value
+            total_rank += rank_value
+            total_preserve += preserve_value
+            pbar.set_postfix({"loss": loss_value, "rank": rank_value, "preserve": preserve_value})
+
+        steps = max(len(self.train_loader), 1)
+        logger.info(
+            "End Epoch %s [Dim %s] - loss=%.4f rank=%.4f preserve=%.4f",
+            epoch_idx,
+            target_dim,
+            total_loss / steps,
+            total_rank / steps,
+            total_preserve / steps,
+        )
+        return total_loss / steps
 
     def train_sequential(self, dimensions: list[int], epochs_per_dim: int = 3):
-        """
-        Main Sequential Loop (SMRL).
-        Args:
-            dimensions: List of target dimensions descending, e.g. [768, 384, 192]
-        """
-        for i, dim in enumerate(dimensions):
-            logger.info(f"=== Starting Training for Dimension: {dim} ===")
-            
-            # 1. Set model target dimension (activates ADS for this dim)
-            self.model.set_ads_target_dim(dim)
+        if not dimensions:
+            raise ValueError("dimensions must not be empty")
 
-            # 1.1 Reset memory queue to match active embedding dimension
-            # (required because queue tensor shape depends on embedding_dim)
-            self.memory = SelectiveCrossBatchMemory(
-                memory_size=1024,
-                embedding_dim=dim,
-                device=self.device
-            )
-            
-            # 2. Freeze/Unfreeze Logic
-            # SMRL: "Parameters optimized in previous steps are frozen."
-            # If i > 0: freeze previous ADS layers?
-            # Our simpler ADS implementation might just be one layer.
-            # If we learn a mask, maybe we freeze mask values for kept dimensions?
-            # For simplicity in this implementation plan:
-            # We assume we retrain/finetune or keep training.
-            # Strict SMEC: Freeze backbone always? Or just after first step?
-            # "Backbone frozen during ADS training." -> Implies backbone always frozen if just training ADS?
-            # Or Sequence: Train Backbone (Full) -> Freeze Backbone -> Train ADS (D/2) -> Freeze ADS(D/2) -> ...
-            
-            if i == 0:
-                # First step: Train backbone? Or assumes backbone is pretrained?
-                # Usually MRL starts with finetuning backbone.
-                self.model.unfreeze_backbone()
-            else:
-                # Subsequent steps: Freeze backbone, train ADS
-                self.model.freeze_backbone()
-            
-            # 2.1 Ensure new ADS layer is on correct device
+        full_dim = self.model.embedding_dim
+        if dimensions[0] != full_dim:
+            dimensions = [full_dim] + dimensions
+
+        self.model.reset_compression()
+        for dim in dimensions:
+            if dim == full_dim:
+                logger.info("Saving frozen backbone baseline for dimension %s", dim)
+                self.save_checkpoint(f"checkpoint_dim_{dim}")
+                continue
+
+            logger.info("=== Starting SMRL transition to dimension: %s ===", dim)
+            self.model.ensure_stage(dim)
             self.model.to(self.device)
-            
-            # 2.2 Re-initialize optimizer with current trainable parameters (MANDATORY for Sequential Training)
-            trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+            self.model.freeze_completed_stages()
+            self.memory = self._new_memory()
+
+            trainable_params = self.model.trainable_compression_parameters()
             if not trainable_params:
-                logger.warning(f"No trainable parameters found for dimension {dim}. Skipping optimizer initialization.")
-            else:
-                self.optimizer = optim.AdamW(trainable_params, lr=self.learning_rate)
-                # Note: GradScaler handles the new optimizer automatically in the next step()
-            
-            # 3. Train loop
+                raise RuntimeError(f"No trainable ADS parameters for dimension {dim}")
+            self.optimizer = optim.AdamW(trainable_params, lr=self.learning_rate)
+
             for epoch in range(epochs_per_dim):
                 self.train_one_epoch(epoch, dim)
-                
-            # 4. Save checkpoint
+
             self.save_checkpoint(f"checkpoint_dim_{dim}")
 
     def save_checkpoint(self, name: str):
         path = os.path.join(self.output_dir, name)
-        torch.save(self.model.state_dict(), path)
-        logger.info(f"Saved model to {path}")
+        payload = {
+            "model_state_dict": self.model.state_dict(),
+            "metadata": self.model.checkpoint_metadata(),
+        }
+        torch.save(payload, path)
+        logger.info("Saved model checkpoint to %s", path)
 
     def _tokenize(self, texts):
-        # Helper to tokenize batch
-        # Assuming tokenizer is accessible or passed in logic
-        # For this skeleton, we'll need the tokenizer attached to model or passed in
-        # We can get it from model.model_name
         from transformers import AutoTokenizer
-        if not hasattr(self, 'tokenizer'):
-             self.tokenizer = AutoTokenizer.from_pretrained(self.model.model_name)
-             
+
+        if not hasattr(self, "tokenizer"):
+            self.tokenizer = AutoTokenizer.from_pretrained(self.model.model_name)
+
         return self.tokenizer(
-            texts, 
-            padding=True, 
-            truncation=True, 
-            return_tensors="pt", 
-            max_length=self.max_length
+            texts,
+            padding=True,
+            truncation=True,
+            return_tensors="pt",
+            max_length=self.max_length,
         )
