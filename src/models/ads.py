@@ -2,56 +2,61 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+
 class AdaptiveDimensionSelection(nn.Module):
     """
-    Adaptive Dimension Selection (ADS) Layer.
-    Uses Gumbel-Softmax to learn a mask for selecting important dimensions.
+    Adaptive Dimension Selection (ADS).
+
+    The layer learns a differentiable input-dimension selector for one SMRL
+    transition, e.g. 768 -> 384. Training uses Gumbel-Softmax; evaluation uses
+    deterministic probabilities so a checkpoint always emits stable embeddings.
     """
+
     def __init__(self, input_dim: int, output_dim: int, temperature: float = 1.0):
         super().__init__()
+        if output_dim > input_dim:
+            raise ValueError("output_dim must be <= input_dim")
+
         self.input_dim = input_dim
         self.output_dim = output_dim
         self.temperature = temperature
-        
-        self.gate_logits = nn.Parameter(torch.randn(output_dim, input_dim))
+        self.gate_logits = nn.Parameter(torch.empty(output_dim, input_dim))
+        self.reset_parameters()
 
-    def sample_gumbel(self, shape, eps=1e-20):
-        """
-        Sample Gumbel(0,1) noise:
-           g = -log(-log(u))
-        where u ~ Uniform(0,1)
-        """
-        U = torch.rand(shape, device=self.gate_logits.device)
-        return -torch.log(-torch.log(U + eps) + eps)
+    def reset_parameters(self):
+        nn.init.xavier_uniform_(self.gate_logits)
+
+    def selection_matrix(self, hard: bool = False) -> torch.Tensor:
+        if self.training:
+            return F.gumbel_softmax(
+                self.gate_logits,
+                tau=self.temperature,
+                hard=hard,
+                dim=-1,
+            )
+
+        probabilities = F.softmax(self.gate_logits / self.temperature, dim=-1)
+        if not hard:
+            return probabilities
+
+        indices = probabilities.argmax(dim=-1)
+        return F.one_hot(indices, num_classes=self.input_dim).to(probabilities.dtype)
 
     def forward(self, x: torch.Tensor, hard: bool = False) -> torch.Tensor:
-        """
-        Args:
-            x: Input embeddings (Batch, Input_Dim)
-            hard: Whether to return hard one-hot vectors (discrete selection)
-        Returns:
-            Compressed embeddings (Batch, Output_Dim) 
-        """
-        device = x.device
-        if self.gate_logits.device != device:
-            self.gate_logits.data = self.gate_logits.data.to(device)
-        # Sample Gumbel noise
-        gumbel_noise = self.sample_gumbel(self.gate_logits.shape)
-        # Add noise and scale by temperature
-        logits_with_noise = (self.gate_logits + gumbel_noise) / self.temperature
-        selection_matrix = F.softmax(logits_with_noise, dim=-1)  # (Output_Dim, Input_Dim)
-        
-        return x @ selection_matrix.T  # (Batch, Output_Dim)
+        if x.size(-1) != self.input_dim:
+            raise ValueError(f"Expected input dim {self.input_dim}, got {x.size(-1)}")
+
+        selected = x @ self.selection_matrix(hard=hard).T
+        return F.normalize(selected, p=2, dim=-1)
+
 
 class TopKSelector(nn.Module):
-    """
-    Selects top-k dimensions based on learned importance.
-    """
+    """Select top-k dimensions according to external importance scores."""
+
     def __init__(self, k: int):
         super().__init__()
         self.k = k
 
     def forward(self, x: torch.Tensor, importance_scores: torch.Tensor):
-        # Implementation of taking top-k features
         topk_indices = torch.topk(importance_scores, self.k).indices
         return x[:, topk_indices]
